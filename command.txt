@@ -1,0 +1,31 @@
+conda activate OMG4
+
+python train.py \
+  --config ./configs/dynerf/cook_spinach.yaml \
+  --start_checkpoint /media/ai2lab/SSD4TB/OMG4/4dgs_pretrained/cook_spinach.pth \
+  --grad /media/ai2lab/SSD4TB/OMG4/gradient/cook_spinach/gradient \
+  --out_path ./cook_spinach_comp
+
+python edit_3d.py \
+  --config configs/dynerf/cook_spinach.yaml \
+  --comp_checkpoint ./cook_spinach_comp/comp.xz \
+  --edited_images_path data/n3v/cook_spinach/painting \
+  --edited_pattern "edited_painting_original_time{frame_id}_{camera_id}.png" \
+  --prompt "Make it look like a fauvism painting" \
+  --out_path ./cook_spinach_edit \
+  --iterations 1000
+
+python refine_sds.py \
+  --config configs/dynerf/cook_spinach.yaml \
+  --checkpoint ./cook_spinach_edit/chkpnt_edit_Make_it_look_like_a_fauvism_painting_1000.pth \
+  --prompt "Make it look like a fauvism painting" \
+  --out_path ./cook_spinach_edit_sds \
+  --iterations 800 \
+  --save_iterations 100 300 500 800
+
+python render_edited4d.py \
+  --config configs/dynerf/cook_spinach.yaml \
+  --checkpoint ./cook_spinach_edit_sds/chkpnt_sds_Make_it_look_like_a_fauvism_painting_800.pth \
+  --out_path ./cook_spinach_edit_sds_render \
+  --skip_train \
+  --fps 30
