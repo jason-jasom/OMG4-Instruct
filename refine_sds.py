@@ -45,16 +45,35 @@ def update_densification_stats(gaussians, render_pkgs, iteration, opt, scene):
         return
     if opt.densify_until_num_points >= 0 and gaussians.get_xyz.shape[0] >= opt.densify_until_num_points:
         return
+    if not render_pkgs:
+        return
 
+    visibility_stack = torch.stack([pkg["visibility_filter"] for pkg in render_pkgs], dim=1)
+    visibility_count = visibility_stack.sum(dim=1)
+    visibility_filter = visibility_count > 0
+    radii = torch.stack([pkg["radii"] for pkg in render_pkgs], dim=1).max(dim=1).values
+    gaussians.max_radii2D[visibility_filter] = torch.max(
+        gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
+    )
+
+    point_grads = []
     for pkg in render_pkgs:
-        visibility_filter = pkg["visibility_filter"]
-        radii = pkg["radii"]
-        viewspace_points = pkg["viewspace_points"]
-        gaussians.max_radii2D[visibility_filter] = torch.max(
-            gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
-        )
-        t_grad = gaussians._t.grad.detach() if gaussians.gaussian_dim == 4 and gaussians._t.grad is not None else None
-        gaussians.add_densification_stats(viewspace_points, visibility_filter, t_grad)
+        viewspace_grad = pkg["viewspace_points"].grad
+        if viewspace_grad is None:
+            viewspace_grad = torch.zeros_like(pkg["viewspace_points"])
+        point_grads.append(torch.norm(viewspace_grad[:, :2], dim=-1))
+    viewspace_point_grad = torch.stack(point_grads, dim=1).sum(dim=1)
+    viewspace_point_grad[visibility_filter] *= len(render_pkgs) / visibility_count[visibility_filter].clamp_min(1)
+    viewspace_point_grad = viewspace_point_grad.unsqueeze(1)
+
+    t_grad = None
+    if gaussians.gaussian_dim == 4:
+        if gaussians._t.grad is None:
+            t_grad = torch.zeros_like(gaussians._t)
+        else:
+            t_grad = gaussians._t.grad.detach().clone()
+            t_grad[visibility_filter] *= len(render_pkgs) / visibility_count[visibility_filter].clamp_min(1).unsqueeze(1)
+    gaussians.add_densification_stats_grad(viewspace_point_grad, visibility_filter, t_grad)
 
     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -100,7 +119,7 @@ def build_ip2p(device, dtype):
 
     ddim_source = "CompVis/stable-diffusion-v1-4"
     ip2p_source = "timbrooks/instruct-pix2pix"
-    # seed_everything(20211202)
+    seed_everything(20211202)
     tokenizer = CLIPTokenizer.from_pretrained(ip2p_source, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(ip2p_source, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(ip2p_source, subfolder="vae")
@@ -207,11 +226,11 @@ def build_view_loader(train_views, args):
 
 
 def train_sds(dataset, opt, pipe, args):
-    if getattr(args, "comp_checkpoint", None) and args.densify:
-        raise ValueError("--densify is not supported when refining from comp.xz; decoded comp models use the network representation.")
+    args.densify = False
     tb_writer = prepare_output(args)
     dataset.dataloader = True
     scene, gaussians, _ = create_scene_and_gaussians(dataset, opt, pipe, args, load_checkpoint=True, shuffle=False)
+    print("3DGS-only SDS refine: optimizing canonical 3D Gaussian parameters; time/4D and decoded MLP parameters are frozen.")
 
     device = torch.device("cuda:0")
     dtype = torch.float16
@@ -278,9 +297,13 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
     add_omg4_runtime_args(parser)
     parser.add_argument("--prompt", default="", type=str)
-    parser.add_argument("--comp_net_lr", default=0.0, type=float, help="Opt-in MLP lr for comp.xz refinement. Default freezes the half-precision MLP.")
+    parser.add_argument("--canonical_only", dest="canonical_only", action="store_true", default=False, help="Deprecated: this script now always optimizes canonical 3DGS parameters only.")
+    parser.add_argument("--optimize_view_feature", dest="canonical_only", action="store_false", help="Deprecated: this script now always optimizes canonical 3DGS parameters only.")
+    parser.add_argument("--comp_net_lr", default=0.0, type=float, help="Deprecated: decoded MLPs are frozen in 3DGS-only SDS refinement.")
+    parser.add_argument("--appearance_mlp_lr", default=0.0, type=float, help="Deprecated: decoded MLPs are frozen in 3DGS-only SDS refinement.")
+    parser.add_argument("--cont_mlp_lr", default=0.0, type=float, help="Deprecated: decoded MLPs are frozen in 3DGS-only SDS refinement.")
     parser.add_argument("--sequence_length", default=4, type=int)
-    parser.add_argument("--custom_sampler", action="store_true", help="Use utils.loader_utils.FineSampler for frame-aware view sampling.")
+    parser.add_argument("--custom_sampler", dest="custom_sampler", action="store_true", help="Use utils.loader_utils.FineSampler for frame-aware view sampling.")
     parser.add_argument("--sampler_workers", default=0, type=int)
     parser.add_argument("--sampler_repeats_per_frame", default=4, type=int)
     parser.add_argument("--sampler_history_mix", default=2, type=int)
@@ -291,13 +314,21 @@ if __name__ == "__main__":
     parser.add_argument("--t_max", default=0.98, type=float)
     parser.add_argument("--guidance_scale", default=10.5, type=float)
     parser.add_argument("--image_guidance_scale", default=1.2, type=float)
-    parser.add_argument("--densify", dest="densify", action="store_true", default=False, help="Allow OMG4 densification/pruning during refinement.")
+    parser.add_argument("--densify", dest="densify", action="store_true", default=False, help="Deprecated: densification/pruning is disabled in 3DGS-only SDS refinement.")
     parser.add_argument("--disable_densify", dest="densify", action="store_false")
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[100, 300, 500, 800])
     parser.add_argument("--log_interval", default=25, type=int)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--detect_anomaly", action="store_true", default=False)
     args = merge_config_args(get_combined_args(parser))
+    args.optimize_decoded_appearance = False
+    args.optimize_canonical_3dgs = True
+    args.optimize_all_except_mlp = False
+    args.canonical_only = False
+    args.comp_net_lr = 0.0
+    args.appearance_mlp_lr = 0.0
+    args.cont_mlp_lr = 0.0
+    args.densify = False
 
     if not args.prompt:
         raise ValueError("Please provide --prompt for SDS refinement.")

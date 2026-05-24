@@ -92,22 +92,99 @@ def resolve_checkpoint(model_path, checkpoint=None, iteration=-1):
     return max(candidates, key=checkpoint_iter)
 
 
-def _as_parameter(value):
+def _as_parameter(value, requires_grad=True):
     if isinstance(value, nn.Parameter):
+        value.requires_grad_(requires_grad)
         return value
-    return nn.Parameter(value.detach().clone().float().cuda().requires_grad_(True))
+    return nn.Parameter(value.detach().clone().float().cuda().requires_grad_(requires_grad))
 
 
-def setup_decoded_comp_training(gaussians, opt, optimize_geometry=False, net_lr=0.0):
-    gaussians._xyz = _as_parameter(gaussians._xyz)
-    gaussians._scaling = _as_parameter(gaussians._scaling)
-    gaussians._rotation = _as_parameter(gaussians._rotation)
-    gaussians._t = _as_parameter(gaussians._t)
-    gaussians._scaling_t = _as_parameter(gaussians._scaling_t)
+def setup_direct_3dgs_training(gaussians, opt):
+    gaussians._xyz = _as_parameter(gaussians._xyz, requires_grad=True)
+    gaussians._features_dc = _as_parameter(gaussians._features_dc, requires_grad=True)
+    gaussians._features_rest = _as_parameter(gaussians._features_rest, requires_grad=True)
+    gaussians._scaling = _as_parameter(gaussians._scaling, requires_grad=True)
+    gaussians._rotation = _as_parameter(gaussians._rotation, requires_grad=True)
+    gaussians._opacity = _as_parameter(gaussians._opacity, requires_grad=True)
+    if gaussians.gaussian_dim == 4:
+        gaussians._t = _as_parameter(gaussians._t, requires_grad=False)
+        gaussians._scaling_t = _as_parameter(gaussians._scaling_t, requires_grad=False)
+        if gaussians.rot_4d:
+            gaussians._rotation_r = _as_parameter(gaussians._rotation_r, requires_grad=False)
+        gaussians.t_gradient_accum = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
+    gaussians.percent_dense = opt.percent_dense
+    gaussians.xyz_gradient_accum = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
+    gaussians.denom = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
+    gaussians.max_radii2D = torch.zeros((gaussians.get_xyz.shape[0]), device="cuda")
+    gaussians.optimizer = torch.optim.Adam(
+        [
+            {"params": [gaussians._xyz], "lr": opt.position_lr_init * gaussians.spatial_lr_scale, "name": "xyz"},
+            {"params": [gaussians._features_dc], "lr": opt.feature_lr, "name": "f_dc"},
+            {"params": [gaussians._features_rest], "lr": opt.feature_lr / 20.0, "name": "f_rest"},
+            {"params": [gaussians._opacity], "lr": opt.opacity_lr, "name": "opacity"},
+            {"params": [gaussians._scaling], "lr": opt.scaling_lr, "name": "scaling"},
+            {"params": [gaussians._rotation], "lr": opt.rotation_lr, "name": "rotation"},
+            *(
+                [
+                    {"params": [gaussians._t], "lr": 0.0, "name": "t"},
+                    {"params": [gaussians._scaling_t], "lr": 0.0, "name": "scaling_t"},
+                    *(
+                        [{"params": [gaussians._rotation_r], "lr": 0.0, "name": "rotation_r"}]
+                        if gaussians.gaussian_dim == 4 and gaussians.rot_4d
+                        else []
+                    ),
+                ]
+                if gaussians.gaussian_dim == 4
+                else []
+            ),
+        ],
+        lr=0.0,
+        eps=1e-8,
+    )
+    gaussians.xyz_scheduler_args = get_expon_lr_func(
+        lr_init=opt.position_lr_init * gaussians.spatial_lr_scale,
+        lr_final=opt.position_lr_final * gaussians.spatial_lr_scale,
+        lr_delay_mult=opt.position_lr_delay_mult,
+        max_steps=opt.position_lr_max_steps,
+    )
+    gaussians.optimizer_net = None
+
+
+def setup_canonical_appearance_training(gaussians, opt):
+    setup_direct_3dgs_training(gaussians, opt)
+    gaussians._xyz.requires_grad_(False)
+    gaussians._scaling.requires_grad_(False)
+    gaussians._rotation.requires_grad_(False)
+    gaussians._opacity.requires_grad_(False)
+    gaussians.optimizer = torch.optim.Adam(
+        [
+            {"params": [gaussians._features_dc], "lr": opt.feature_lr, "name": "f_dc"},
+            {"params": [gaussians._features_rest], "lr": opt.feature_lr / 20.0, "name": "f_rest"},
+        ],
+        lr=0.0,
+        eps=1e-8,
+    )
+
+
+def setup_decoded_comp_training(
+    gaussians,
+    opt,
+    canonical_only=True,
+    optimize_geometry=False,
+    net_lr=0.0,
+    optimize_time=False,
+    appearance_mlp_lr=0.0,
+    cont_mlp_lr=0.0,
+):
+    gaussians._xyz = _as_parameter(gaussians._xyz, requires_grad=optimize_geometry)
+    gaussians._scaling = _as_parameter(gaussians._scaling, requires_grad=optimize_geometry)
+    gaussians._rotation = _as_parameter(gaussians._rotation, requires_grad=optimize_geometry)
+    gaussians._t = _as_parameter(gaussians._t, requires_grad=optimize_time)
+    gaussians._scaling_t = _as_parameter(gaussians._scaling_t, requires_grad=optimize_time)
     if gaussians.rot_4d:
-        gaussians._rotation_r = _as_parameter(gaussians._rotation_r)
-    gaussians._features_static = _as_parameter(gaussians._features_static)
-    gaussians._features_view = _as_parameter(gaussians._features_view)
+        gaussians._rotation_r = _as_parameter(gaussians._rotation_r, requires_grad=optimize_time)
+    gaussians._features_static = _as_parameter(gaussians._features_static, requires_grad=True)
+    gaussians._features_view = _as_parameter(gaussians._features_view, requires_grad=not canonical_only)
 
     gaussians.percent_dense = opt.percent_dense
     gaussians.xyz_gradient_accum = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda")
@@ -117,14 +194,22 @@ def setup_decoded_comp_training(gaussians, opt, optimize_geometry=False, net_lr=
 
     groups = [
         {"params": [gaussians._features_static], "lr": opt.feature_lr, "name": "f_static"},
-        {"params": [gaussians._features_view], "lr": opt.feature_lr, "name": "f_view"},
     ]
+    if not canonical_only:
+        groups.append({"params": [gaussians._features_view], "lr": opt.feature_lr, "name": "f_view"})
     if optimize_geometry:
         groups.extend([
             {"params": [gaussians._xyz], "lr": opt.position_lr_init * gaussians.spatial_lr_scale, "name": "xyz"},
             {"params": [gaussians._scaling], "lr": opt.scaling_lr, "name": "scaling"},
             {"params": [gaussians._rotation], "lr": opt.rotation_lr, "name": "rotation"},
-            {"params": [gaussians._t], "lr": (opt.position_t_lr_init if opt.position_t_lr_init > 0 else opt.position_lr_init) * gaussians.spatial_lr_scale, "name": "t"},
+        ])
+    if optimize_time:
+        groups.extend([
+            {
+                "params": [gaussians._t],
+                "lr": (opt.position_t_lr_init if opt.position_t_lr_init > 0 else opt.position_lr_init) * gaussians.spatial_lr_scale,
+                "name": "t",
+            },
             {"params": [gaussians._scaling_t], "lr": opt.scaling_lr, "name": "scaling_t"},
         ])
         if gaussians.rot_4d:
@@ -138,16 +223,52 @@ def setup_decoded_comp_training(gaussians, opt, optimize_geometry=False, net_lr=
     )
 
     gaussians.optimizer_net = None
+    for module in (gaussians.mlp_cont, gaussians.mlp_view, gaussians.mlp_dc, gaussians.mlp_opacity):
+        for param in module.parameters():
+            param.requires_grad_(False)
     if net_lr > 0:
-        mlp_params = []
         for module in (gaussians.mlp_cont, gaussians.mlp_view, gaussians.mlp_dc, gaussians.mlp_opacity):
-            mlp_params.extend(list(module.parameters()))
-        # tcnn stores these params in half precision; a tiny Adam eps can underflow and
-        # turn the first update into Inf/NaN. Keep this opt-in and use a fp16-safe eps.
-        gaussians.optimizer_net = torch.optim.Adam(mlp_params, lr=net_lr, eps=1e-4)
+            for param in module.parameters():
+                param.requires_grad_(True)
+        gaussians.optimizer_net = torch.optim.Adam(
+            [
+                {"params": list(gaussians.mlp_cont.parameters()), "lr": net_lr, "name": "MLP_cont"},
+                {"params": list(gaussians.mlp_view.parameters()), "lr": net_lr, "name": "MLP_sh"},
+                {"params": list(gaussians.mlp_dc.parameters()), "lr": net_lr, "name": "MLP_dc"},
+                {"params": list(gaussians.mlp_opacity.parameters()), "lr": net_lr, "name": "MLP_opacity"},
+            ],
+            lr=0.0,
+            eps=1e-4,
+        )
+    elif appearance_mlp_lr > 0 or cont_mlp_lr > 0:
+        groups = []
+        if cont_mlp_lr > 0:
+            for param in gaussians.mlp_cont.parameters():
+                param.requires_grad_(True)
+            groups.append({"params": list(gaussians.mlp_cont.parameters()), "lr": cont_mlp_lr, "name": "MLP_cont"})
+        if appearance_mlp_lr > 0:
+            for module in (gaussians.mlp_view, gaussians.mlp_dc, gaussians.mlp_opacity):
+                for param in module.parameters():
+                    param.requires_grad_(True)
+            groups.extend([
+                {"params": list(gaussians.mlp_view.parameters()), "lr": appearance_mlp_lr, "name": "MLP_sh"},
+                {"params": list(gaussians.mlp_dc.parameters()), "lr": appearance_mlp_lr, "name": "MLP_dc"},
+                {"params": list(gaussians.mlp_opacity.parameters()), "lr": appearance_mlp_lr, "name": "MLP_opacity"},
+            ])
+        if groups:
+            gaussians.optimizer_net = torch.optim.Adam(groups, lr=0.0, eps=1e-4)
 
 
-def load_decoded_comp(gaussians, comp_path, opt=None):
+def load_decoded_comp(
+    gaussians,
+    comp_path,
+    opt=None,
+    canonical_only=True,
+    optimize_geometry=False,
+    net_lr=0.0,
+    appearance_mlp_lr=0.0,
+    cont_mlp_lr=0.0,
+):
     gaussians.construct_net(train=False)
     gaussians.decode(load_comp(comp_path), decompress=True)
     gaussians.active_sh_degree = gaussians.max_sh_degree
@@ -155,7 +276,16 @@ def load_decoded_comp(gaussians, comp_path, opt=None):
     if hasattr(gaussians, "env_map") and gaussians.env_map.numel() and gaussians.env_map.device.type != "cuda":
         gaussians.env_map = gaussians.env_map.cuda()
     if opt is not None:
-        setup_decoded_comp_training(gaussians, opt)
+        setup_decoded_comp_training(
+            gaussians,
+            opt,
+            canonical_only=canonical_only,
+            optimize_geometry=optimize_geometry,
+            net_lr=net_lr,
+            optimize_time=False,
+            appearance_mlp_lr=appearance_mlp_lr,
+            cont_mlp_lr=cont_mlp_lr,
+        )
 
 
 def capture_decoded_comp(gaussians):
@@ -178,7 +308,16 @@ def capture_decoded_comp(gaussians):
     }
 
 
-def restore_decoded_comp(gaussians, state, opt=None):
+def restore_decoded_comp(
+    gaussians,
+    state,
+    opt=None,
+    canonical_only=True,
+    optimize_geometry=False,
+    net_lr=0.0,
+    appearance_mlp_lr=0.0,
+    cont_mlp_lr=0.0,
+):
     gaussians.construct_net(train=False)
     gaussians.net_enabled = True
     gaussians.vq_enabled = False
@@ -198,7 +337,16 @@ def restore_decoded_comp(gaussians, state, opt=None):
     gaussians.mlp_view.params = nn.Parameter(state["MLP_sh"].cuda().half().requires_grad_(True))
     gaussians.mlp_opacity.params = nn.Parameter(state["MLP_opacity"].cuda().half().requires_grad_(True))
     if opt is not None:
-        setup_decoded_comp_training(gaussians, opt)
+        setup_decoded_comp_training(
+            gaussians,
+            opt,
+            canonical_only=canonical_only,
+            optimize_geometry=optimize_geometry,
+            net_lr=net_lr,
+            optimize_time=False,
+            appearance_mlp_lr=appearance_mlp_lr,
+            cont_mlp_lr=cont_mlp_lr,
+        )
 
 
 def create_scene_and_gaussians(dataset, opt, pipe, args, load_checkpoint=True, shuffle=True):
@@ -206,6 +354,22 @@ def create_scene_and_gaussians(dataset, opt, pipe, args, load_checkpoint=True, s
     comp_checkpoint = getattr(args, "comp_checkpoint", None)
     iteration = getattr(args, "iteration", -1)
     output_path = getattr(args, "out_path", None)
+    canonical_only = getattr(args, "canonical_only", False)
+    optimize_all_except_mlp = getattr(args, "optimize_all_except_mlp", False)
+    optimize_canonical_3dgs = getattr(args, "optimize_canonical_3dgs", False) or optimize_all_except_mlp
+    optimize_decoded_appearance = getattr(args, "optimize_decoded_appearance", False)
+    comp_canonical_only = False if optimize_canonical_3dgs else canonical_only
+    if optimize_decoded_appearance:
+        comp_canonical_only = False
+    comp_optimize_geometry = optimize_canonical_3dgs and not optimize_decoded_appearance
+    comp_net_lr = 0.0 if (optimize_canonical_3dgs or optimize_decoded_appearance) else getattr(args, "comp_net_lr", 0.0)
+    comp_appearance_mlp_lr = 0.0
+    comp_cont_mlp_lr = 0.0
+    if optimize_decoded_appearance:
+        requested_appearance_lr = getattr(args, "appearance_mlp_lr", -1.0)
+        comp_appearance_mlp_lr = opt.feature_lr * 0.1 if requested_appearance_lr is None or requested_appearance_lr < 0 else requested_appearance_lr
+        requested_cont_lr = getattr(args, "cont_mlp_lr", -1.0)
+        comp_cont_mlp_lr = comp_appearance_mlp_lr * 0.1 if requested_cont_lr is None or requested_cont_lr < 0 else requested_cont_lr
     if comp_checkpoint and not checkpoint:
         source_model_path = os.path.dirname(comp_checkpoint) or args.model_path
     else:
@@ -235,20 +399,40 @@ def create_scene_and_gaussians(dataset, opt, pipe, args, load_checkpoint=True, s
     loaded_iter = None
     if load_checkpoint and comp_checkpoint:
         loaded_from = comp_checkpoint
-        load_decoded_comp(gaussians, loaded_from, opt)
-        if opt is not None and getattr(args, "comp_net_lr", 0.0) > 0:
-            setup_decoded_comp_training(gaussians, opt, net_lr=args.comp_net_lr)
+        load_decoded_comp(
+            gaussians,
+            loaded_from,
+            opt,
+            canonical_only=comp_canonical_only,
+            optimize_geometry=comp_optimize_geometry,
+            net_lr=comp_net_lr,
+            appearance_mlp_lr=comp_appearance_mlp_lr,
+            cont_mlp_lr=comp_cont_mlp_lr,
+        )
         loaded_iter = "comp"
         print(f"Loaded OMG4 compressed model: {loaded_from}")
     elif load_checkpoint:
         loaded_from = resolve_checkpoint(source_model_path, checkpoint, iteration)
         loaded_obj = torch.load(loaded_from, weights_only=False)
         if isinstance(loaded_obj, dict) and loaded_obj.get("format") == "omg4_decoded_comp_v1":
-            restore_decoded_comp(gaussians, loaded_obj, opt)
+            restore_decoded_comp(
+                gaussians,
+                loaded_obj,
+                opt,
+                canonical_only=comp_canonical_only,
+                optimize_geometry=comp_optimize_geometry,
+                net_lr=comp_net_lr,
+                appearance_mlp_lr=comp_appearance_mlp_lr,
+                cont_mlp_lr=comp_cont_mlp_lr,
+            )
             loaded_iter = "decoded_comp"
         else:
             model_params, loaded_iter = loaded_obj
             gaussians.restore(model_params, opt)
+            if opt is not None and optimize_canonical_3dgs:
+                setup_direct_3dgs_training(gaussians, opt)
+            elif opt is not None and (optimize_decoded_appearance or canonical_only):
+                setup_canonical_appearance_training(gaussians, opt)
         print(f"Loaded OMG4 checkpoint: {loaded_from} (iteration {loaded_iter})")
     scene.model_path = output_model_path
     dataset.model_path = output_model_path

@@ -123,7 +123,6 @@ def build_target_pairs(train_views, args):
             if args.fallback_original:
                 pairs.append((idx, gt, cam, None))
         else:
-            print(target_path)
             pairs.append((idx, gt, cam, target_path))
 
     if not pairs:
@@ -191,11 +190,11 @@ def report(tb_writer, iteration, scene, gaussians, pipe, background, loss_value,
 
 
 def train_edit(dataset, opt, pipe, args):
-    if getattr(args, "comp_checkpoint", None) and args.densify:
-        raise ValueError("--densify is not supported when editing from comp.xz; decoded comp models use the network representation.")
+    args.densify = False
     tb_writer = prepare_output(args)
     dataset.dataloader = True
     scene, gaussians, _ = create_scene_and_gaussians(dataset, opt, pipe, args, load_checkpoint=True, shuffle=False)
+    print("3DGS-only edit: optimizing canonical 3D Gaussian parameters; time/4D and decoded MLP parameters are frozen.")
 
     background = background_tensor(dataset)
     print("Preparing camera metadata and matching edited targets...")
@@ -276,8 +275,12 @@ if __name__ == "__main__":
     add_omg4_runtime_args(parser)
     parser.add_argument("--edited_images_path", default="", type=str, help="Directory containing edited RGB targets.")
     parser.add_argument("--edited_pattern", default="", type=str, help="Optional pattern, e.g. '{image_name}.png' or '{index:05d}.png'.")
-    parser.add_argument("--comp_net_lr", default=0.0, type=float, help="Opt-in MLP lr for comp.xz editing. Default freezes the half-precision MLP.")
-    parser.add_argument("--densify", dest="densify", action="store_true", default=False, help="Allow OMG4 densification/pruning during editing.")
+    parser.add_argument("--canonical_only", dest="canonical_only", action="store_true", default=False, help="Deprecated: this script now always optimizes canonical 3DGS parameters only.")
+    parser.add_argument("--optimize_view_feature", dest="canonical_only", action="store_false", help="Deprecated: this script now always optimizes canonical 3DGS parameters only.")
+    parser.add_argument("--comp_net_lr", default=0.0, type=float, help="Deprecated: decoded MLPs are frozen in 3DGS-only editing.")
+    parser.add_argument("--appearance_mlp_lr", default=0.0, type=float, help="Deprecated: decoded MLPs are frozen in 3DGS-only editing.")
+    parser.add_argument("--cont_mlp_lr", default=0.0, type=float, help="Deprecated: decoded MLPs are frozen in 3DGS-only editing.")
+    parser.add_argument("--densify", dest="densify", action="store_true", default=False, help="Deprecated: densification/pruning is disabled in 3DGS-only editing.")
     parser.add_argument("--disable_densify", dest="densify", action="store_false")
     parser.add_argument("--include_test_targets", action="store_true", default=False, help="Also use test camera metadata when matching edited targets.")
     parser.add_argument("--train_only_targets", dest="include_test_targets", action="store_false", help="Use train camera metadata only.")
@@ -290,6 +293,14 @@ if __name__ == "__main__":
     parser.add_argument("--scene", default="", type=str, help="Kept for compatibility with old launch scripts.")
     parser.add_argument("--prompt", default="", type=str, help="Kept for compatibility with old launch scripts.")
     args = merge_config_args(get_combined_args(parser))
+    args.optimize_decoded_appearance = False
+    args.optimize_canonical_3dgs = True
+    args.optimize_all_except_mlp = False
+    args.canonical_only = False
+    args.comp_net_lr = 0.0
+    args.appearance_mlp_lr = 0.0
+    args.cont_mlp_lr = 0.0
+    args.densify = False
 
     if not args.edited_images_path:
         if args.dataset and args.scene and args.prompt:
