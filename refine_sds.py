@@ -226,11 +226,11 @@ def build_view_loader(train_views, args):
 
 
 def train_sds(dataset, opt, pipe, args):
-    args.densify = False
     tb_writer = prepare_output(args)
     dataset.dataloader = True
     scene, gaussians, _ = create_scene_and_gaussians(dataset, opt, pipe, args, load_checkpoint=True, shuffle=False)
     print("3DGS-only SDS refine: optimizing canonical 3D Gaussian parameters; time/4D and decoded MLP parameters are frozen.")
+    print(f"Densification/pruning is {'enabled' if args.densify else 'disabled'}.")
 
     device = torch.device("cuda:0")
     dtype = torch.float16
@@ -314,7 +314,7 @@ if __name__ == "__main__":
     parser.add_argument("--t_max", default=0.98, type=float)
     parser.add_argument("--guidance_scale", default=10.5, type=float)
     parser.add_argument("--image_guidance_scale", default=1.2, type=float)
-    parser.add_argument("--densify", dest="densify", action="store_true", default=False, help="Deprecated: densification/pruning is disabled in 3DGS-only SDS refinement.")
+    parser.add_argument("--densify", dest="densify", action="store_true", default=False, help="Enable Gaussian densification/pruning during SDS refinement.")
     parser.add_argument("--disable_densify", dest="densify", action="store_false")
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[100, 300, 500, 800])
     parser.add_argument("--log_interval", default=25, type=int)
@@ -328,7 +328,6 @@ if __name__ == "__main__":
     args.comp_net_lr = 0.0
     args.appearance_mlp_lr = 0.0
     args.cont_mlp_lr = 0.0
-    args.densify = False
 
     if not args.prompt:
         raise ValueError("Please provide --prompt for SDS refinement.")

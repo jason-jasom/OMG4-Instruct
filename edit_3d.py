@@ -54,7 +54,12 @@ def update_densification_stats(gaussians, render_pkgs, iteration, opt, scene):
         gaussians.max_radii2D[visibility_filter] = torch.max(
             gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
         )
-        t_grad = gaussians._t.grad.detach() if gaussians.gaussian_dim == 4 and gaussians._t.grad is not None else None
+        t_grad = None
+        if gaussians.gaussian_dim == 4:
+            if gaussians._t.grad is None:
+                t_grad = torch.zeros_like(gaussians._t)
+            else:
+                t_grad = gaussians._t.grad.detach()
         gaussians.add_densification_stats(viewspace_points, visibility_filter, t_grad)
 
     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
@@ -190,11 +195,11 @@ def report(tb_writer, iteration, scene, gaussians, pipe, background, loss_value,
 
 
 def train_edit(dataset, opt, pipe, args):
-    args.densify = False
     tb_writer = prepare_output(args)
     dataset.dataloader = True
     scene, gaussians, _ = create_scene_and_gaussians(dataset, opt, pipe, args, load_checkpoint=True, shuffle=False)
     print("3DGS-only edit: optimizing canonical 3D Gaussian parameters; time/4D and decoded MLP parameters are frozen.")
+    print(f"Densification/pruning is {'enabled' if args.densify else 'disabled'}.")
 
     background = background_tensor(dataset)
     print("Preparing camera metadata and matching edited targets...")
@@ -280,7 +285,7 @@ if __name__ == "__main__":
     parser.add_argument("--comp_net_lr", default=0.0, type=float, help="Deprecated: decoded MLPs are frozen in 3DGS-only editing.")
     parser.add_argument("--appearance_mlp_lr", default=0.0, type=float, help="Deprecated: decoded MLPs are frozen in 3DGS-only editing.")
     parser.add_argument("--cont_mlp_lr", default=0.0, type=float, help="Deprecated: decoded MLPs are frozen in 3DGS-only editing.")
-    parser.add_argument("--densify", dest="densify", action="store_true", default=False, help="Deprecated: densification/pruning is disabled in 3DGS-only editing.")
+    parser.add_argument("--densify", dest="densify", action="store_true", default=False, help="Enable Gaussian densification/pruning during editing.")
     parser.add_argument("--disable_densify", dest="densify", action="store_false")
     parser.add_argument("--include_test_targets", action="store_true", default=False, help="Also use test camera metadata when matching edited targets.")
     parser.add_argument("--train_only_targets", dest="include_test_targets", action="store_false", help="Use train camera metadata only.")
@@ -300,7 +305,6 @@ if __name__ == "__main__":
     args.comp_net_lr = 0.0
     args.appearance_mlp_lr = 0.0
     args.cont_mlp_lr = 0.0
-    args.densify = False
 
     if not args.edited_images_path:
         if args.dataset and args.scene and args.prompt:
