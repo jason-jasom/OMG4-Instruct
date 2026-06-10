@@ -4,7 +4,7 @@
 
 ## 2. Install Instruct-4DGS packages
 
-Install the packages required by [Instruct-4DGS](https://github.com/CHINHUICHU/Instruct-4DGS/tree/test).
+Install the packages required by [Instruct-4DGS](https://github.com/CHINHUICHU/Instruct-4DGS/blob/test/README_instruct4dgs.md).
 
 ## 3. Generate edited images with Instruct-4DGS
 
